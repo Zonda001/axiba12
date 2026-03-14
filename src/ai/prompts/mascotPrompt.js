@@ -3,18 +3,34 @@
  *
  * Prompt engineering for cooking-app mascot generation via Stability AI.
  *
- * PROMPT STRATEGY:
- *  • Positive prompt  = subject + style + personality + color + quality anchors
- *  • Negative prompt  = anti-realism + anti-artifacts + category-specific exclusions
- *  • style_preset     = mapped from MASCOT_STYLES to Stability AI accepted values
- *
- * SECURITY:
- *  • System-hardcoded quality/composition directives are ALWAYS appended last
- *    so user text cannot override them
- *  • User text (subjectName, extraDetails) passes through sanitizePromptFragment()
- *    before entering the prompt
- *  • This module never calls any API — pure prompt construction
+ * CHANGES:
+ *  • Added MASCOT_EMOTIONS (neutral / happy / sad) for emotion-set generation
+ *  • Strengthened pure white background directives in positive + negative prompts
+ *  • buildMascotPrompt now accepts optional `emotion` parameter
  */
+
+// ─── Emotion variants ────────────────────────────────────────────────────────
+
+export const MASCOT_EMOTIONS = {
+    NEUTRAL: {
+        id: "neutral",
+        label: "😐 Нейтральний",
+        promptHint:
+            "calm neutral expression, relaxed composed face, subtle slight smile, no strong emotion, serene look",
+    },
+    HAPPY: {
+        id: "happy",
+        label: "😄 Веселий",
+        promptHint:
+            "wide bright cheerful smile, happy crinkled eyes, joyful exuberant expression, big grin, upbeat energetic pose",
+    },
+    SAD: {
+        id: "sad",
+        label: "😢 Сумний",
+        promptHint:
+            "sad drooping eyes, slight downward frown, melancholic dejected expression, slumped gentle pose, tearful glistening eyes",
+    },
+};
 
 // ─── Catalog objects ──────────────────────────────────────────────────────────
 
@@ -22,7 +38,7 @@ export const MASCOT_TYPES = {
     CHEF: {
         id: "chef", label: "Шеф-кухар", icon: "👨‍🍳",
         description: "Головний персонаж-кухар",
-        subjectLabel: null,   // no free-text subject needed
+        subjectLabel: null,
         subjectPlaceholder: null,
     },
     INGREDIENT: {
@@ -118,31 +134,31 @@ export const MASCOT_PERSONALITIES = {
 };
 
 export const MASCOT_COLORS = [
-    { id: "red",      label: "Червоний",          hex: "#EF4444", prompt: "vibrant red and white color palette"              },
-    { id: "orange",   label: "Помаранчевий",       hex: "#F97316", prompt: "warm orange and cream color palette"              },
-    { id: "yellow",   label: "Жовтий / Золотий",   hex: "#EAB308", prompt: "sunny golden yellow and warm white color palette" },
-    { id: "green",    label: "Зелений",             hex: "#22C55E", prompt: "fresh bright green and mint color palette"        },
-    { id: "blue",     label: "Блакитний",           hex: "#3B82F6", prompt: "sky blue and soft white color palette"            },
-    { id: "purple",   label: "Фіолетовий",          hex: "#8B5CF6", prompt: "royal purple and lavender color palette"          },
-    { id: "pink",     label: "Рожевий",             hex: "#EC4899", prompt: "bubbly pastel pink and white color palette"       },
-    { id: "brown",    label: "Коричневий",           hex: "#92400E", prompt: "warm chocolate brown and tan color palette"       },
-    { id: "gold",     label: "Золото / Преміум",    hex: "#D97706", prompt: "luxurious gold and cream color palette, premium feel" },
-    { id: "rainbow",  label: "Різнокольоровий",     hex: null,      prompt: "vibrant multicolor rainbow palette, colorful and joyful" },
+    { id: "red",      label: "Червоний",        hex: "#EF4444", prompt: "vibrant red and white color palette"              },
+    { id: "orange",   label: "Помаранчевий",     hex: "#F97316", prompt: "warm orange and cream color palette"              },
+    { id: "yellow",   label: "Жовтий / Золотий", hex: "#EAB308", prompt: "sunny golden yellow and warm white color palette" },
+    { id: "green",    label: "Зелений",           hex: "#22C55E", prompt: "fresh bright green and mint color palette"        },
+    { id: "blue",     label: "Блакитний",         hex: "#3B82F6", prompt: "sky blue and soft white color palette"            },
+    { id: "purple",   label: "Фіолетовий",        hex: "#8B5CF6", prompt: "royal purple and lavender color palette"          },
+    { id: "pink",     label: "Рожевий",           hex: "#EC4899", prompt: "bubbly pastel pink and white color palette"       },
+    { id: "brown",    label: "Коричневий",         hex: "#92400E", prompt: "warm chocolate brown and tan color palette"       },
+    { id: "gold",     label: "Золото / Преміум",  hex: "#D97706", prompt: "luxurious gold and cream color palette, premium feel" },
+    { id: "rainbow",  label: "Різнокольоровий",   hex: null,      prompt: "vibrant multicolor rainbow palette, colorful and joyful" },
 ];
 
 // ─── Main prompt builder ──────────────────────────────────────────────────────
 
 /**
- * Builds the positive prompt, negative prompt, and style preset
- * for a mascot generation request.
+ * Builds the positive prompt, negative prompt, and style preset.
  *
  * @param {Object}  cfg
- * @param {string}  cfg.type         - Key of MASCOT_TYPES (case-insensitive)
- * @param {string}  cfg.style        - Key of MASCOT_STYLES (case-insensitive)
- * @param {string}  cfg.personality  - Key of MASCOT_PERSONALITIES (case-insensitive)
- * @param {string}  cfg.color        - id of one entry in MASCOT_COLORS
- * @param {string}  [cfg.subjectName]   - Sanitized user text for ingredient/dish/appliance/animal
- * @param {string}  [cfg.extraDetails]  - Sanitized extra hints from the user
+ * @param {string}  cfg.type
+ * @param {string}  cfg.style
+ * @param {string}  cfg.personality
+ * @param {string}  cfg.color
+ * @param {string}  [cfg.subjectName]
+ * @param {string}  [cfg.extraDetails]
+ * @param {string}  [cfg.emotion]   - "neutral" | "happy" | "sad"  (overrides personality expression)
  *
  * @returns {{ prompt: string, negativePrompt: string, stylePreset: string }}
  */
@@ -153,45 +169,50 @@ export function buildMascotPrompt({
                                       color       = "red",
                                       subjectName   = "",
                                       extraDetails  = "",
+                                      emotion       = null,   // ← NEW: when set, overrides the face/expression part
                                   }) {
-    // Resolve catalog entries (fall back to defaults gracefully)
     const typeKey  = type.toUpperCase();
     const styleKey = style.toUpperCase();
     const persKey  = personality.toUpperCase();
 
-    const typeCfg  = MASCOT_TYPES[typeKey]          ?? MASCOT_TYPES.CHEF;
-    const styleCfg = MASCOT_STYLES[styleKey]        ?? MASCOT_STYLES.CARTOON;
-    const persCfg  = MASCOT_PERSONALITIES[persKey]  ?? MASCOT_PERSONALITIES.HAPPY;
+    const typeCfg  = MASCOT_TYPES[typeKey]         ?? MASCOT_TYPES.CHEF;
+    const styleCfg = MASCOT_STYLES[styleKey]       ?? MASCOT_STYLES.CARTOON;
+    const persCfg  = MASCOT_PERSONALITIES[persKey] ?? MASCOT_PERSONALITIES.HAPPY;
     const colorCfg = MASCOT_COLORS.find(c => c.id === color) ?? MASCOT_COLORS[0];
 
-    // Sanitize user-provided fragments
+    // Emotion overrides the expression part of personality
+    const emotionKey  = emotion ? emotion.toUpperCase() : null;
+    const emotionCfg  = emotionKey ? (MASCOT_EMOTIONS[emotionKey] ?? null) : null;
+    const expressionHint = emotionCfg ? emotionCfg.promptHint : persCfg.promptHint;
+
     const subject = sanitizePromptFragment(subjectName);
     const extras  = sanitizePromptFragment(extraDetails);
 
-    // ── Type-specific subject prompt ──────────────────────────────────────────
-    const subjectPrompt = buildSubjectPrompt(typeCfg.id, subject);
+    const subjectPrompt = buildSubjectPrompt(typeCfg.id, subject, extras);
 
-    // ── Assemble full positive prompt ─────────────────────────────────────────
-    // ORDER MATTERS: subject → style → personality → color → fixed quality anchors
-    // Fixed quality anchors are LAST so they cannot be diluted by user text
+    // ── Positive prompt ───────────────────────────────────────────────────────
+    // Order: subject → art style → expression/emotion → color → extras → fixed anchors
+    // Fixed white-background anchors are LAST so they cannot be overridden
     const parts = [
         subjectPrompt,
         styleCfg.promptHint,
-        persCfg.promptHint,
+        expressionHint,
         colorCfg.prompt,
         extras || null,
-        // ── Hardcoded quality & composition directives ────────────────────────
-        "isolated on pure white background",
-        "full body character design",
+        // ── Fixed quality & background anchors ────────────────────────────────
+        "pure white background",
+        "solid white background only",
+        "isolated character on white",
+        "no background elements",
+        "full body character",
         "centered composition",
         "mascot illustration",
         "no text, no letters, no watermark",
-        "masterpiece, best quality, sharp details, high resolution",
+        "masterpiece, best quality, sharp clean details, high resolution",
     ].filter(Boolean);
 
     const prompt = parts.join(", ");
 
-    // ── Negative prompt ───────────────────────────────────────────────────────
     const negativePrompt = buildNegativePrompt(typeCfg.id);
 
     return { prompt, negativePrompt, stylePreset: styleCfg.stylePreset };
@@ -199,40 +220,54 @@ export function buildMascotPrompt({
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
-function buildSubjectPrompt(typeId, subject) {
+function buildSubjectPrompt(typeId, subject, extras) {
+    const concept = extras || subject || null;
     switch (typeId) {
         case "chef":
-            return "cute cartoon chef mascot character, wearing tall white toque blanche chef hat and double-breasted chef apron, holding a wooden ladle and cooking spoon, friendly cooking character";
+            return concept
+                ? `cute cartoon ${concept} mascot character, chef theme, wearing chef hat and apron, friendly cooking character, full body`
+                : "cute cartoon chef mascot character, wearing tall white toque blanche chef hat and double-breasted chef apron, holding a wooden ladle, friendly cooking character, full body";
 
         case "ingredient":
-            return `cute anthropomorphic ${subject || "tomato"} food ingredient mascot character, round body with big expressive eyes, tiny stubby arms and legs, adorable smiling face, anthropomorphic food character`;
+            return `cute anthropomorphic ${concept || "tomato"} food ingredient mascot character, round body with big expressive eyes, tiny stubby arms and legs, adorable smiling face, full body`;
 
         case "dish":
-            return `cute anthropomorphic ${subject || "bowl of borsch soup"} dish mascot character, friendly bowl or plate shape with an expressive face, tiny arms, charming cooking mascot`;
+            return `cute anthropomorphic ${concept || "bowl of borsch soup"} dish mascot character, friendly bowl or plate shape with an expressive face, tiny arms, charming cooking mascot, full body`;
 
         case "appliance":
-            return `cute anthropomorphic ${subject || "frying pan"} kitchen appliance mascot character, cooking tool with a cute smiling face, tiny arms and personality, charming kitchen mascot`;
+            return `cute anthropomorphic ${concept || "frying pan"} kitchen appliance mascot character, cooking tool with a cute smiling face, tiny arms and personality, full body`;
 
         case "animal":
-            return `cute ${subject || "bear"} animal chef mascot character, wearing a chef hat and apron, adorable anthropomorphic animal cooking character, full body`;
+            return `cute ${concept || "bear"} animal chef mascot character, wearing a chef hat and apron, adorable anthropomorphic animal cooking character, full body`;
 
         case "trophy":
-            return "cute golden cooking trophy award mascot character, shiny trophy cup with a cute smiling face, wearing a tiny chef hat, achievement mascot character";
+            return `cute golden ${concept ? concept + " " : ""}cooking trophy award mascot character, shiny trophy cup with a cute smiling face, wearing a tiny chef hat, achievement mascot, full body`;
 
         default:
-            return "cute cooking mascot character, kitchen theme";
+            return `cute ${concept || "cooking"} mascot character, kitchen theme, full body`;
     }
 }
 
 function buildNegativePrompt(typeId) {
     const universal = [
+        // ── Background — most important for our use-case ──────────────────────
+        "background",
+        "colored background",
+        "dark background",
+        "gradient background",
+        "textured background",
+        "pattern background",
+        "environment",
+        "scene",
+        "landscape",
+        "room",
+        "kitchen background",
+        "shadow on background",
+        "drop shadow",
+        // ── Quality issues ────────────────────────────────────────────────────
         "realistic photograph",
         "photorealistic",
         "photo",
-        "3d photorealistic render",
-        "dark background",
-        "colored background",
-        "gradient background",
         "blurry",
         "low quality",
         "bad anatomy",
@@ -241,7 +276,8 @@ function buildNegativePrompt(typeId) {
         "disfigured",
         "poorly drawn",
         "extra limbs",
-        "multiple characters in scene",
+        "multiple characters",
+        // ── Unwanted elements ─────────────────────────────────────────────────
         "text",
         "letters",
         "watermark",
@@ -255,29 +291,22 @@ function buildNegativePrompt(typeId) {
     ];
 
     const typeSpecific = {
-        ingredient: ["real food photo", "non-anthropomorphic food", "food without face"],
-        dish:       ["real food photo", "non-anthropomorphic dish", "actual photograph of food"],
-        chef:       ["scary face", "horror", "dark theme"],
+        ingredient: ["real food photo", "non-anthropomorphic food"],
+        dish:       ["real food photo", "actual photograph of food"],
         animal:     ["scary", "aggressive", "wild animal attack"],
-        trophy:     ["realistic metal photo"],
     };
 
-    const extra = typeSpecific[typeId] ?? [];
-    return [...universal, ...extra].join(", ");
+    return [...universal, ...(typeSpecific[typeId] ?? [])].join(", ");
 }
 
-/**
- * Strips characters that could cause prompt injection or break the image generation prompt.
- * Stability AI prompts are processed differently than LLM text, but we still sanitize.
- */
 function sanitizePromptFragment(text) {
     if (typeof text !== "string") return "";
     return text
         .trim()
-        .slice(0, 100)                          // hard length cap
-        .replace(/[<>{}\[\]\\]/g, "")           // remove structural chars
-        .replace(/\n|\r/g, " ")                 // flatten newlines
-        .replace(/\s{2,}/g, " ")                // collapse whitespace
-        .replace(/ignore|system:|override|jailbreak|bypass/gi, "") // strip obvious injection attempts
+        .slice(0, 100)
+        .replace(/[<>{}\[\]\\]/g, "")
+        .replace(/\n|\r/g, " ")
+        .replace(/\s{2,}/g, " ")
+        .replace(/ignore|system:|override|jailbreak|bypass/gi, "")
         .trim();
 }
