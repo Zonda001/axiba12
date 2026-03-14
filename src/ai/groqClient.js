@@ -6,33 +6,22 @@
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-// Models used across the app
 export const GROQ_MODELS = {
-    // Vision model for photo analysis (ingredients & step verification)
     VISION: "meta-llama/llama-4-scout-17b-16e-instruct",
-    // Text model for recipe generation
-    TEXT: "llama-3.3-70b-versatile",
+    TEXT:   "llama-3.3-70b-versatile",
 };
 
 const DEFAULT_OPTIONS = {
-    temperature: 0.3,       // lower = more predictable, structured output
-    max_tokens: 2048,
-    top_p: 0.9,
+    temperature: 0.3,
+    max_tokens:  8192,   // raised default; callers can still override downward
+    top_p:       0.9,
 };
 
 /**
  * Core request function.
- * @param {Object} params
- * @param {string} params.model
- * @param {Array}  params.messages   - Already-built message array (system + user)
- * @param {Object} params.options    - Override temperature, max_tokens etc.
- * @param {string} params.apiKey     - Groq API key
- * @returns {Promise<string>}        - Raw text content from the model
  */
 export async function groqRequest({ model, messages, options = {}, apiKey }) {
-    if (!apiKey) {
-        throw new Error("GROQ_API_KEY is not configured");
-    }
+    if (!apiKey) throw new Error("GROQ_API_KEY is not configured");
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
         throw new Error("messages array is required and must not be empty");
@@ -42,17 +31,16 @@ export async function groqRequest({ model, messages, options = {}, apiKey }) {
         model,
         messages,
         temperature: options.temperature ?? DEFAULT_OPTIONS.temperature,
-        max_tokens: options.max_tokens ?? DEFAULT_OPTIONS.max_tokens,
-        top_p: options.top_p ?? DEFAULT_OPTIONS.top_p,
-        // Never stream — we need the full response to validate it
-        stream: false,
+        max_tokens:  options.max_tokens  ?? DEFAULT_OPTIONS.max_tokens,
+        top_p:       options.top_p       ?? DEFAULT_OPTIONS.top_p,
+        stream:      false,
     };
 
     const response = await fetch(GROQ_API_URL, {
-        method: "POST",
+        method:  "POST",
         headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
+            Authorization:  `Bearer ${apiKey}`,
         },
         body: JSON.stringify(payload),
     });
@@ -66,12 +54,17 @@ export async function groqRequest({ model, messages, options = {}, apiKey }) {
         );
     }
 
-    const data = await response.json();
-
+    const data    = await response.json();
     const content = data?.choices?.[0]?.message?.content;
 
     if (typeof content !== "string" || content.trim().length === 0) {
         throw new Error("Groq returned empty or invalid content");
+    }
+
+    // Warn (don't throw) if the model hit the token limit — partial JSON
+    const finishReason = data?.choices?.[0]?.finish_reason;
+    if (finishReason === "length") {
+        console.warn("[groqClient] finish_reason=length — response was truncated. Consider raising max_tokens.");
     }
 
     return content.trim();
@@ -79,29 +72,114 @@ export async function groqRequest({ model, messages, options = {}, apiKey }) {
 
 /**
  * Parses JSON from model response.
- * Models sometimes wrap JSON in markdown code blocks — we strip those.
+ *
+ * Strategy (most-to-least strict):
+ *  1. Strip markdown fences, try direct parse
+ *  2. Find the outermost [...] or {...} and parse that
+ *  3. Find the LAST complete JSON array/object (handles trailing garbage)
  */
 export function parseJSONResponse(rawContent) {
-    // Strip ```json ... ``` or ``` ... ```
+    if (typeof rawContent !== "string") throw new Error("rawContent must be a string");
+
+    // Step 1 — strip markdown fences
     const stripped = rawContent
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```\s*$/, "")
+        .replace(/^```(?:json)?\s*/im, "")
+        .replace(/\s*```\s*$/m, "")
         .trim();
 
+    // Step 2 — direct parse
     try {
         return JSON.parse(stripped);
-    } catch {
-        // Try to extract JSON object/array from surrounding text
-        const jsonMatch = stripped.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-        if (jsonMatch) {
-            try {
-                return JSON.parse(jsonMatch[1]);
-            } catch {
-                throw new Error("Failed to parse JSON from model response");
-            }
-        }
-        throw new Error("No valid JSON found in model response");
+    } catch { /* continue */ }
+
+    // Step 3 — extract outermost array first (recipes always return an array)
+    const arrayMatch = findOutermostBracket(stripped, "[", "]");
+    if (arrayMatch) {
+        try { return JSON.parse(arrayMatch); } catch { /* continue */ }
     }
+
+    // Step 4 — extract outermost object
+    const objectMatch = findOutermostBracket(stripped, "{", "}");
+    if (objectMatch) {
+        try { return JSON.parse(objectMatch); } catch { /* continue */ }
+    }
+
+    // Step 5 — try to find and parse the LAST valid JSON array in the string
+    //          (handles "Here are your recipes:\n[...]" preamble text)
+    const lastArrayIdx = stripped.lastIndexOf("[");
+    if (lastArrayIdx !== -1) {
+        const candidate = stripped.slice(lastArrayIdx);
+        try { return JSON.parse(candidate); } catch { /* continue */ }
+
+        // If still failing, the JSON was truncated — try to close it gracefully
+        const repaired = attemptRepair(candidate);
+        if (repaired) {
+            try { return JSON.parse(repaired); } catch { /* continue */ }
+        }
+    }
+
+    throw new Error("Failed to parse JSON from model response");
+}
+
+/**
+ * Finds the substring that starts at the first occurrence of `open`
+ * and ends at the matching closing bracket.
+ */
+function findOutermostBracket(str, open, close) {
+    const start = str.indexOf(open);
+    if (start === -1) return null;
+
+    let depth = 0;
+    let inString = false;
+    let escape   = false;
+
+    for (let i = start; i < str.length; i++) {
+        const ch = str[i];
+        if (escape)          { escape = false; continue; }
+        if (ch === "\\")     { escape = true;  continue; }
+        if (ch === '"')      { inString = !inString; continue; }
+        if (inString)        continue;
+        if (ch === open)     depth++;
+        else if (ch === close) {
+            depth--;
+            if (depth === 0) return str.slice(start, i + 1);
+        }
+    }
+    return null;
+}
+
+/**
+ * Very simple repair: if JSON is truncated mid-array, try to close it.
+ * Only handles the common case of truncation inside a recipe object.
+ */
+function attemptRepair(truncated) {
+    // Count unclosed braces / brackets
+    let braces   = 0;
+    let brackets = 0;
+    let inString = false;
+    let escape   = false;
+
+    for (const ch of truncated) {
+        if (escape)        { escape = false; continue; }
+        if (ch === "\\")   { escape = true;  continue; }
+        if (ch === '"')    { inString = !inString; continue; }
+        if (inString)      continue;
+        if (ch === "{")    braces++;
+        else if (ch === "}") braces--;
+        else if (ch === "[") brackets++;
+        else if (ch === "]") brackets--;
+    }
+
+    if (braces < 0 || brackets < 0) return null; // already over-closed
+
+    // Strip trailing incomplete field (last comma or partial key/value)
+    let repaired = truncated.trimEnd();
+    // Remove trailing comma before we close
+    repaired = repaired.replace(/,\s*$/, "");
+
+    // Close any open braces then brackets
+    repaired += "}".repeat(braces) + "]".repeat(brackets);
+    return repaired;
 }
 
 /**
@@ -116,14 +194,10 @@ export async function groqRequestWithRetry(params, maxRetries = 2) {
         } catch (error) {
             lastError = error;
 
-            // Don't retry on auth errors or invalid requests
             if (error instanceof GroqAPIError) {
-                if (error.status === 401 || error.status === 400 || error.status === 422) {
-                    throw error;
-                }
+                if ([401, 400, 422].includes(error.status)) throw error;
             }
 
-            // Exponential backoff: 1s, 2s, 4s
             if (attempt < maxRetries) {
                 await new Promise((resolve) =>
                     setTimeout(resolve, Math.pow(2, attempt) * 1000)
@@ -135,25 +209,19 @@ export async function groqRequestWithRetry(params, maxRetries = 2) {
     throw lastError;
 }
 
-/**
- * Custom error class for Groq API errors.
- */
 export class GroqAPIError extends Error {
     constructor(message, status, body) {
         super(message);
-        this.name = "GroqAPIError";
+        this.name   = "GroqAPIError";
         this.status = status;
-        this.body = body;
+        this.body   = body;
     }
 }
 
-/**
- * Converts a File/Blob to base64 data URL for vision requests.
- */
 export async function fileToBase64(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
+        reader.onload  = () => resolve(reader.result);
         reader.onerror = () => reject(new Error("Failed to read file"));
         reader.readAsDataURL(file);
     });
